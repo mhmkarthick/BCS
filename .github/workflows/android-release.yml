@@ -132,7 +132,25 @@ jobs:
           # Poll EAS until the build finishes.
           for i in $(seq 1 60); do
             STATUS=$(eas build:view "$EAS_BUILD_ID" --non-interactive --json 2>/dev/null \
-              | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{try{console.log(JSON.parse(d).status)}catch{e}})"; true)
+              | node -e "
+                let d = '';
+                process.stdin.on('data', c => d += c);
+                process.stdin.on('end', () => {
+                  try {
+                    const obj = JSON.parse(d);
+                    if (!obj || typeof obj.status !== 'string' || obj.status.length === 0) {
+                      console.error('ERROR: EAS build:view response missing status field');
+                      console.error('Response:', d.substring(0, 500));
+                      process.exit(1);
+                    }
+                    console.log(obj.status);
+                  } catch (err) {
+                    console.error('ERROR: Failed to parse EAS build status response');
+                    console.error('Response:', d.substring(0, 500));
+                    process.exit(1);
+                  }
+                });
+              ")
             echo "Build status: $STATUS"
             if [ "$STATUS" = "finished" ]; then break; fi
             if [ "$STATUS" = "errored" ] || [ "$STATUS" = "failed" ] || [ "$STATUS" = "canceled" ]; then
