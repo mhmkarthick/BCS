@@ -82,7 +82,9 @@
             "./assets/fonts/Newsreader-Italic.ttf"
           ]
         }
-      ]
+      ],
+      "expo-sharing",
+      "expo-status-bar"
     ],
     "experiments": {
       "typedRoutes": false
