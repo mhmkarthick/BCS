@@ -1,0 +1,286 @@
+name: Android Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version name (e.g. 1.1.0)'
+        required: true
+        default: '1.1.0'
+      release_notes:
+        description: 'Release notes for the GitHub release'
+        required: false
+        default: 'See CHANGELOG for details.'
+
+permissions:
+  contents: write
+
+env:
+  APP_ID: in.brightcakes.snacks
+  APK_NAME_PREFIX: Bright-Cakes-Snacks
+  EAS_PROJECT_ID: f3a7ed9d-c1b4-4e4e-9caa-8fdeb4334fc6
+  BUILD_ARTIFACT_DIR: build-artifacts
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+
+      - name: Run tests
+        run: npx jest --passWithNoTests
+
+      - name: Install Android SDK build tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y zipalign apksigner
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "$ANDROID_HOME/build-tools/34.0.0" >> $GITHUB_PATH
+
+      - name: Validate semantic version input
+        id: validate-version
+        run: |
+          VERSION="${{ github.event.inputs.version }}"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "ERROR: Invalid version '$VERSION'. Must be semver (e.g. 1.1.0)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "major=$(echo "$VERSION" | cut -d. -f1)" >> $GITHUB_OUTPUT
+          echo "minor=$(echo "$VERSION" | cut -d. -f2)" >> $GITHUB_OUTPUT
+          echo "patch=$(echo "$VERSION" | cut -d. -f3)" >> $GITHUB_OUTPUT
+
+      - name: Set app version in app.json
+        env:
+          APP_VERSION: ${{ steps.validate-version.outputs.version }}
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('app.json', 'utf8'));
+            pkg.expo.version = process.env.APP_VERSION;
+            fs.writeFileSync('app.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "Updated app.json version to $APP_VERSION"
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli@latest
+
+      - name: Authenticate with Expo
+        run: eas login --token "${EXPO_TOKEN}"
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+
+      - name: Check for duplicate release tag
+        id: check-tag
+        run: |
+          TAG="v${{ steps.validate-version.outputs.version }}"
+          if gh release view "${TAG}" --json tagName >/dev/null 2>&1; then
+            echo "ERROR: Release tag ${TAG} already exists. Duplicate tags are not allowed."
+            exit 1
+          fi
+
+      - name: Determine next version code
+        id: version-code
+        run: |
+          # Query EAS for the latest production build to find the highest versionCode.
+          # If no prior build exists, start at 1.
+          LATEST_CODE=$(eas build:list --platform android --profile production --non-interactive --json 2>/dev/null \
+            | node -e "
+              let data = '';
+              process.stdin.on('data', c => data += c);
+              process.stdin.on('end', () => {
+                try {
+                  const arr = JSON.parse(data);
+                  const codes = arr
+                    .filter(b => b.status === 'finished')
+                    .map(b => b.versionCode || 0)
+                    .filter(c => c > 0);
+                  console.log(codes.length > 0 ? Math.max(...codes) + 1 : 1);
+                } catch {
+                  console.log(1);
+                }
+              });
+            ")
+          echo "version_code=$LATEST_CODE" >> $GITHUB_OUTPUT
+          echo "Resolved next Android version code: $LATEST_CODE"
+
+      - name: Build production APK with EAS Build
+        id: eas-build
+        env:
+          VERSION_CODE: ${{ steps.version-code.outputs.version_code }}
+        run: |
+          eas build --platform android --profile production --non-interactive
+
+      - name: Wait for EAS build completion and download APK
+        id: eas-download
+        env:
+          EAS_BUILD_ID: ${{ steps.eas-build.outputs.build_id }}
+        run: |
+          # Poll EAS until the build finishes.
+          for i in $(seq 1 60); do
+            STATUS=$(eas build:view "$EAS_BUILD_ID" --non-interactive --json 2>/dev/null \
+              | node -e "let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{try{console.log(JSON.parse(d).status)}catch{e}})"; true)
+            echo "Build status: $STATUS"
+            if [ "$STATUS" = "finished" ]; then break; fi
+            if [ "$STATUS" = "errored" ] || [ "$STATUS" = "failed" ] || [ "$STATUS" = "canceled" ]; then
+              echo "ERROR: EAS build did not complete successfully (status: $STATUS)"
+              exit 1
+            fi
+            sleep 30
+          done
+
+          # Download the build artifact.
+          eas build:download "$EAS_BUILD_ID" --output "$BUILD_ARTIFACT_DIR/app-release.apk" --non-interactive
+          if [ ! -f "$BUILD_ARTIFACT_DIR/app-release.apk" ]; then
+            echo "ERROR: APK download failed."
+            exit 1
+          fi
+          echo "APK_PATH=$BUILD_ARTIFACT_DIR/app-release.apk" >> $GITHUB_ENV
+          echo "APK downloaded successfully."
+
+      - name: Verify APK exists
+        run: |
+          APK_PATH="${{ env.APK_PATH }}"
+          if [ ! -f "$APK_PATH" ] || [ ! -s "$APK_PATH" ]; then
+            echo "ERROR: APK is missing or empty at $APK_PATH"
+            exit 1
+          fi
+          echo "APK verified: $(du -h "$APK_PATH" | cut -f1)"
+
+      - name: Verify package ID and version
+        env:
+          APK_PATH: ${{ env.APK_PATH }}
+          EXPECTED_VERSION: ${{ steps.validate-version.outputs.version }}
+          EXPECTED_PACKAGE_ID: ${{ env.APP_ID }}
+          EXPECTED_VERSION_CODE: ${{ steps.version-code.outputs.version_code }}
+        run: |
+          PACKAGE_ID=$(aapt dump badging "$APK_PATH" | grep 'package:' | sed "s/.*name='\([^']*\)'.*/\1/")
+          VERSION_NAME=$(aapt dump badging "$APK_PATH" | grep 'versionName:' | sed "s/.*versionName='\([^']*\)'.*/\1/")
+          VERSION_CODE=$(aapt dump badging "$APK_PATH" | grep 'versionCode:' | sed "s/.*versionCode='\([^']*\)'.*/\1/")
+
+          echo "Package ID: $PACKAGE_ID"
+          echo "Version name: $VERSION_NAME"
+          echo "Version code: $VERSION_CODE"
+
+          if [ "$PACKAGE_ID" != "$EXPECTED_PACKAGE_ID" ]; then
+            echo "ERROR: Package ID mismatch. Expected $EXPECTED_PACKAGE_ID, got $PACKAGE_ID"
+            exit 1
+          fi
+          if [ "$VERSION_NAME" != "$EXPECTED_VERSION" ]; then
+            echo "ERROR: Version name mismatch. Expected $EXPECTED_VERSION, got $VERSION_NAME"
+            exit 1
+          fi
+          if [ -z "$VERSION_CODE" ] || [ "$VERSION_CODE" -le 0 ]; then
+            echo "ERROR: Invalid version code: $VERSION_CODE"
+            exit 1
+          fi
+          echo "Package ID, version name, and version code verified."
+
+      - name: Verify APK signature
+        env:
+          APK_PATH: ${{ env.APK_PATH }}
+        run: |
+          if ! command -v apksigner >/dev/null 2>&1; then
+            echo "ERROR: apksigner is not available."
+            exit 1
+          fi
+          apksigner verify --print-certs "$APK_PATH"
+          if [ $? -ne 0 ]; then
+            echo "ERROR: APK signature verification failed."
+            exit 1
+          fi
+          echo "APK signature verification passed."
+
+      - name: Verify signing certificate fingerprint
+        env:
+          APK_PATH: ${{ env.APK_PATH }}
+        run: |
+          # Extract SHA-256 fingerprint of the signing certificate from the APK.
+          FINGERPRINT=$(apksigner print-certs "$APK_PATH" 2>/dev/null \
+            | grep -i 'SHA-256:' \
+            | head -1 \
+            | sed 's/.*SHA-256: *//i' \
+            | tr '[:lower:]' '[:upper:]')
+          if [ -z "$FINGERPRINT" ]; then
+            echo "ERROR: Could not extract signing certificate fingerprint."
+            exit 1
+          fi
+          echo "APK signing certificate fingerprint: $FINGERPRINT"
+
+          # Compare against the existing production certificate fingerprint
+          # stored in GitHub secret ANDROID_CERT_FINGERPRINT_SHA256.
+          if [ -z "${ANDROID_CERT_FINGERPRINT_SHA256}" ]; then
+            echo "ERROR: ANDROID_CERT_FINGERPRINT_SHA256 secret is not configured."
+            exit 1
+          fi
+          EXPECTED_FP=$(echo "${ANDROID_CERT_FINGERPRINT_SHA256}" | tr '[:lower:]' '[:upper:]')
+          if [ "$FINGERPRINT" != "$EXPECTED_FP" ]; then
+            echo "ERROR: Signing certificate fingerprint mismatch."
+            echo "  Expected: $EXPECTED_FP"
+            echo "  Actual:   $FINGERPRINT"
+            exit 1
+          fi
+          echo "Signing certificate fingerprint verified against production identity."
+
+      - name: Calculate SHA-256 checksum
+        run: |
+          APK_PATH="${{ env.APK_PATH }}"
+          sha256sum "$APK_PATH" > "${APK_PATH}.sha256"
+          echo "CHECKSUM_FILE=${APK_PATH}.sha256" >> $GITHUB_ENV
+          echo "SHA-256 checksum generated."
+
+      - name: Rename APK and checksum for release
+        env:
+          VERSION: ${{ steps.validate-version.outputs.version }}
+          APK_PATH: ${{ env.APK_PATH }}
+        run: |
+          NEW_APK_NAME="${APK_NAME_PREFIX}-v${VERSION}.apk"
+          NEW_CHECKSUM_NAME="${NEW_APK_NAME}.sha256"
+          cp "$APK_PATH" "$NEW_APK_NAME"
+          cp "${APK_PATH}.sha256" "$NEW_CHECKSUM_NAME"
+          echo "RELEASE_APK=$NEW_APK_NAME" >> $GITHUB_ENV
+          echo "RELEASE_CHECKSUM=$NEW_CHECKSUM_NAME" >> $GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.validate-version.outputs.version }}
+          RELEASE_NOTES: ${{ github.event.inputs.release_notes }}
+        with:
+          tag_name: v${{ steps.validate-version.outputs.version }}
+          name: Bright Cakes & Snacks v${{ steps.validate-version.outputs.version }}
+          body: |
+            # Bright Cakes & Snacks v${{ steps.validate-version.outputs.version }}
+
+            ${{ steps.validate-version.outputs.release_notes }}
+
+            ## Installation
+
+            Download the APK below and install it on your Android device.
+            If this is an update over a previous version, your data and orders
+            are preserved automatically.
+
+            ## Verification
+
+            SHA-256 checksums are provided for each APK. Verify the download
+            before installing.
+
+            ---
+            *Built with EAS Build · Expo SDK 58 · Signed with Expo-managed production identity*
+          files: |
+            ${{ env.RELEASE_APK }}
+            ${{ env.RELEASE_CHECKSUM }}
