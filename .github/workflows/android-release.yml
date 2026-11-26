@@ -24,6 +24,8 @@ env:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    env:
+      EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -80,8 +82,6 @@ jobs:
 
       - name: Authenticate with Expo
         run: eas whoami
-        env:
-          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
 
       - name: Check for duplicate release tag
         id: check-tag
